@@ -15,6 +15,8 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any, Iterable, Iterator
 
@@ -32,6 +34,13 @@ AUTH_HELP = "Run `agy` to sign in. Local stats are still shown."
 STATUS_QUOTA_UNAVAILABLE = f"{AGENT_NAME} quota unavailable"
 STATUS_DATABASE_ERROR = f"{AGENT_NAME} database error"
 STATUS_DB_ERROR = STATUS_DATABASE_ERROR
+MAX_METADATA_BYTES = 64 * 1024
+TOKEN_BUCKET = {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+}
 
 # ---------------------------------------------------------------------------
 # Lightweight Protobuf Wire-Format Decoder
@@ -151,6 +160,90 @@ class ProtobufParser:
                 break
 
 
+def _text(value: bytes | bytearray) -> str:
+    return value.decode("utf-8", errors="replace").strip()
+
+
+def _timestamp(value: bytes | bytearray) -> int | None:
+    for field, _, item in ProtobufParser(value):
+        if field == 1 and isinstance(item, int) and 1_000_000_000 <= item <= 2_500_000_000:
+            return item
+    return None
+
+
+def _usage_event(
+    value: bytes | bytearray,
+    *,
+    model: str = "",
+    timestamp: int | None = None,
+) -> dict[str, Any]:
+    """Decode one ModelUsageStats protobuf without retaining opaque data."""
+    input_tokens = output_tokens = cache_read = cache_creation = 0
+    thinking = visible = 0
+    identities: list[str] = []
+    response_id = ""
+    for field, _, item in ProtobufParser(value):
+        if field == 2 and isinstance(item, int):
+            input_tokens = item
+        elif field == 3 and isinstance(item, int):
+            output_tokens = item
+        elif field == 4 and isinstance(item, int):
+            cache_creation = item
+        elif field == 5 and isinstance(item, int):
+            cache_read = item
+        elif field == 9 and isinstance(item, int):
+            thinking = item
+        elif field == 10 and isinstance(item, int):
+            visible = item
+        elif field in (7, 11, 12) and isinstance(item, (bytes, bytearray)):
+            decoded = _text(item)
+            if decoded:
+                kind = {7: "agent", 11: "response", 12: "provider"}[field]
+                identities.append(f"{kind}:{decoded}")
+                if field == 11:
+                    response_id = decoded
+    return {
+        "model": model,
+        "input": input_tokens,
+        "output": max(output_tokens, thinking + visible),
+        "cacheRead": cache_read,
+        "cacheCreation": cache_creation,
+        "timestamp": timestamp,
+        "identities": identities,
+        "responseId": response_id,
+    }
+
+
+def _generation_events(g_data: bytes | bytearray) -> list[dict[str, Any]]:
+    """Return primary and retry usage entries stored in gen_metadata.data."""
+    model = ""
+    timestamp = None
+    usage_blobs: list[bytes | bytearray] = []
+    retry_blobs: list[bytes | bytearray] = []
+    for field, _, value in ProtobufParser(g_data):
+        if field != 1 or not isinstance(value, (bytes, bytearray)):
+            continue
+        for sub_field, _, sub_value in ProtobufParser(value):
+            if sub_field in (19, 21) and isinstance(sub_value, (bytes, bytearray)):
+                model = _text(sub_value) or model
+            elif sub_field == 3 and isinstance(sub_value, int) and not model:
+                model = f"antigravity-model-{sub_value}"
+            elif sub_field == 4 and isinstance(sub_value, (bytes, bytearray)):
+                usage_blobs.append(sub_value)
+            elif sub_field == 9 and isinstance(sub_value, (bytes, bytearray)):
+                for timing_field, _, timing_value in ProtobufParser(sub_value):
+                    if timing_field == 4 and isinstance(timing_value, (bytes, bytearray)):
+                        timestamp = _timestamp(timing_value) or timestamp
+            elif sub_field == 17 and isinstance(sub_value, (bytes, bytearray)):
+                retry_blobs.append(sub_value)
+    events = [_usage_event(blob, model=model, timestamp=timestamp) for blob in usage_blobs]
+    for retry in retry_blobs:
+        for field, _, value in ProtobufParser(retry):
+            if field == 2 and isinstance(value, (bytes, bytearray)):
+                events.append(_usage_event(value, model=model, timestamp=timestamp))
+    return events
+
+
 def parse_gen_metadata(g_data: bytes) -> tuple[str, int, int, int, str]:
     """Extracts model name, token counts, and response ID from gen_metadata.data.
 
@@ -216,63 +309,11 @@ def parse_gen_metadata(g_data: bytes) -> tuple[str, int, int, int, str]:
         (model_name, input_tokens, output_tokens, cache_read_tokens, response_id).
         Defaults to ("", 0, 0, 0, "") if payload is empty, corrupted, or has no counts.
     """
-    FIELD_GEN_INFO = 1
-    FIELD_MODEL_NAME = 19
-    FIELD_USAGE_METADATA = 4
-    FIELD_INPUT_TOKENS = 2
-    FIELD_OUTPUT_TOKENS = 3
-    FIELD_CACHE_READ_TOKENS = 5
-    FIELD_THINKING_OUTPUT_TOKENS = 9
-    FIELD_RESPONSE_OUTPUT_TOKENS = 10
-    FIELD_RESPONSE_ID = 11
-
-    model = ""
-    inp = 0
-    out = 0
-    cache_read = 0
-    thinking_out = 0
-    response_out = 0
-    response_id = ""
-
-    for fn, _, val in ProtobufParser(g_data):
-        if fn == FIELD_GEN_INFO and isinstance(val, (bytes, bytearray)):
-            for sub_fn, _, sub_val in ProtobufParser(val):
-                if sub_fn == FIELD_MODEL_NAME and isinstance(sub_val, (bytes, bytearray)):
-                    try:
-                        decoded = sub_val.decode("utf-8", errors="replace").strip()
-                        if decoded:
-                            model = decoded
-                    except Exception:
-                        pass
-                elif sub_fn == FIELD_USAGE_METADATA and isinstance(sub_val, (bytes, bytearray)):
-                    for u_fn, _, u_val in ProtobufParser(sub_val):
-                        if u_fn == FIELD_INPUT_TOKENS and isinstance(u_val, int):
-                            inp = u_val
-                        elif u_fn == FIELD_OUTPUT_TOKENS and isinstance(u_val, int):
-                            out = u_val
-                        elif u_fn == FIELD_CACHE_READ_TOKENS and isinstance(u_val, int):
-                            cache_read = u_val
-                        elif u_fn == FIELD_THINKING_OUTPUT_TOKENS and isinstance(u_val, int):
-                            thinking_out = u_val
-                        elif u_fn == FIELD_RESPONSE_OUTPUT_TOKENS and isinstance(u_val, int):
-                            response_out = u_val
-                        elif u_fn == FIELD_RESPONSE_ID and isinstance(u_val, (bytes, bytearray)):
-                            try:
-                                decoded = (
-                                    u_val.decode("utf-8", errors="replace").strip()
-                                )
-                                if decoded:
-                                    response_id = decoded
-                            except Exception:
-                                pass
-
-    # If explicit output_tokens (tag 3) is absent or only accounts for candidate text
-    # without reasoning tokens, combine thinking and response tokens so output is never undercounted.
-    combined_out = thinking_out + response_out
-    if combined_out > out:
-        out = combined_out
-
-    return (model, inp, out, cache_read, response_id)
+    events = _generation_events(g_data)
+    if not events:
+        return ("", 0, 0, 0, "")
+    event = events[0]
+    return (event["model"], event["input"], event["output"], event["cacheRead"], event["responseId"])
 
 
 def parse_step_timestamp(s_meta: bytes) -> int | None:
@@ -345,21 +386,37 @@ def parse_step_timestamp(s_meta: bytes) -> int | None:
     Returns:
         Unix timestamp in seconds (e.g. 1757088000), or None if missing or non-positive.
     """
-    FIELD_STEP_HEADER = 1
-    FIELD_TIMESTAMP_SECONDS = 1
-    MIN_VALID_TIMESTAMP_SECONDS = 1_000_000_000  # Sep 2001
-    MAX_VALID_TIMESTAMP_SECONDS = 2_500_000_000  # Mar 2049
-
-    for fn, _, val in ProtobufParser(s_meta):
-        if fn == FIELD_STEP_HEADER and isinstance(val, (bytes, bytearray)):
-            for sub_fn, _, sub_val in ProtobufParser(val):
-                if (
-                    sub_fn == FIELD_TIMESTAMP_SECONDS
-                    and isinstance(sub_val, int)
-                    and MIN_VALID_TIMESTAMP_SECONDS <= sub_val <= MAX_VALID_TIMESTAMP_SECONDS
-                ):
-                    return sub_val
+    fields = list(ProtobufParser(s_meta))
+    for timestamp_field in (8, 1):
+        for field, _, value in fields:
+            if field == timestamp_field and isinstance(value, (bytes, bytearray)):
+                timestamp = _timestamp(value)
+                if timestamp:
+                    return timestamp
     return None
+
+
+def _step_events(s_meta: bytes | bytearray) -> list[dict[str, Any]]:
+    """Decode usage and retry entries from optional steps.metadata rows."""
+    timestamp = parse_step_timestamp(s_meta)
+    model = ""
+    usage_blobs: list[bytes | bytearray] = []
+    retry_blobs: list[bytes | bytearray] = []
+    for field, _, value in ProtobufParser(s_meta):
+        if field == 9 and isinstance(value, (bytes, bytearray)):
+            usage_blobs.append(value)
+        elif field == 24 and isinstance(value, (bytes, bytearray)):
+            for info_field, _, info_value in ProtobufParser(value):
+                if info_field in (8, 12) and isinstance(info_value, (bytes, bytearray)):
+                    model = _text(info_value) or model
+        elif field == 28 and isinstance(value, (bytes, bytearray)):
+            retry_blobs.append(value)
+    events = [_usage_event(blob, model=model, timestamp=timestamp) for blob in usage_blobs]
+    for retry in retry_blobs:
+        for field, _, value in ProtobufParser(retry):
+            if field == 2 and isinstance(value, (bytes, bytearray)):
+                events.append(_usage_event(value, model=model, timestamp=timestamp))
+    return events
 
 
 def default_conversations_dirs() -> list[Path]:
@@ -385,88 +442,86 @@ def stats_from_rows(
 
     Each row is: (session_id, gen_metadata_blob, step_metadata_blob, fallback_mtime).
     """
+    def events() -> Iterator[dict[str, Any]]:
+        for session_id, g_data, s_meta, fallback_mtime in rows:
+            for event in _generation_events(g_data) if isinstance(g_data, (bytes, bytearray)) else []:
+                yield {**event, "session": session_id, "fallback": fallback_mtime}
+            for event in _step_events(s_meta) if isinstance(s_meta, (bytes, bytearray)) else []:
+                yield {**event, "session": session_id, "fallback": fallback_mtime}
+    return stats_from_events(events(), now=now)
+
+
+def stats_from_events(events: Iterable[dict[str, Any]], now: datetime | None = None) -> dict[str, Any]:
+    """Aggregate token-bearing protobuf entries, merging duplicate identities safely."""
     current_now = now or datetime.now()
     today = current_now.strftime("%Y-%m-%d")
     recent_dates = [(current_now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
     recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+    deduped: list[dict[str, Any]] = []
+    by_identity: dict[str, dict[str, Any]] = {}
+    for event in events:
+        identities = [value for value in event.get("identities", []) if isinstance(value, str) and value]
+        existing = next((by_identity[value] for value in identities if value in by_identity), None)
+        if existing is None:
+            deduped.append(event)
+            for value in identities:
+                by_identity[value] = event
+            continue
+        for key in ("input", "output", "cacheRead", "cacheCreation"):
+            existing[key] = max(int(existing.get(key, 0)), int(event.get(key, 0)))
+        if not existing.get("model") and event.get("model"):
+            existing["model"] = event["model"]
+        if existing.get("timestamp") is None and event.get("timestamp") is not None:
+            existing["timestamp"] = event["timestamp"]
+        for value in identities:
+            by_identity[value] = existing
+
     today_tokens_by_model: dict[str, dict[str, int]] = {}
     model_usage: dict[str, dict[str, int]] = {}
     today_sessions: set[str] = set()
-    today_prompts = 0
-    today_total_tokens = 0
-    total_prompts = 0
     total_sessions: set[str] = set()
     active_days: set[str] = set()
-    seen_response_ids: set[str] = set()
-
-    for session_id, g_data, s_meta, fallback_mtime in rows:
-        total_sessions.add(session_id)
-        if not isinstance(g_data, (bytes, bytearray)):
-            continue
-        model, inp, out, cache_read, response_id = parse_gen_metadata(g_data)
-        if response_id:
-            if response_id in seen_response_ids:
-                continue
-            seen_response_ids.add(response_id)
-        total = inp + out + cache_read
+    previous_model: dict[str, str] = {}
+    today_prompts = today_total_tokens = total_prompts = 0
+    for event in deduped:
+        values = {key: max(0, int(event.get(key, 0))) for key in ("input", "output", "cacheRead", "cacheCreation")}
+        total = sum(values.values())
         if total <= 0:
             continue
-
+        session = str(event.get("session") or "")
+        model = str(event.get("model") or previous_model.get(session) or "gemini")
+        previous_model[session] = model
         day = None
-        if isinstance(s_meta, (bytes, bytearray)):
-            sec = parse_step_timestamp(s_meta)
-            if sec:
-                try:
-                    day = datetime.fromtimestamp(sec).strftime("%Y-%m-%d")
-                except Exception:
-                    day = None
-        if not day and fallback_mtime:
-            try:
-                day = datetime.fromtimestamp(fallback_mtime).strftime("%Y-%m-%d")
-            except Exception:
-                day = None
-        if not day:
-            day = today
-
+        try:
+            stamp = event.get("timestamp") or event.get("fallback")
+            if stamp:
+                day = datetime.fromtimestamp(float(stamp)).strftime("%Y-%m-%d")
+        except (OSError, OverflowError, TypeError, ValueError):
+            pass
+        day = day or today
         total_prompts += 1
+        total_sessions.add(session)
         active_days.add(day)
-
-        model_name = model or "gemini"
-        bucket = model_usage.setdefault(
-            model_name,
-            {"inputTokens": 0, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
-        )
-        bucket["inputTokens"] += inp
-        bucket["outputTokens"] += out
-        bucket["cacheReadInputTokens"] += cache_read
-
+        bucket = model_usage.setdefault(model, dict(TOKEN_BUCKET))
+        bucket["inputTokens"] += values["input"]
+        bucket["outputTokens"] += values["output"]
+        bucket["cacheReadInputTokens"] += values["cacheRead"]
+        bucket["cacheCreationInputTokens"] += values["cacheCreation"]
         if day in recent:
             recent[day]["messageCount"] += total
-
         if day == today:
             today_prompts += 1
-            today_sessions.add(session_id)
+            today_sessions.add(session)
             today_total_tokens += total
-            t_bucket = today_tokens_by_model.setdefault(
-                model_name,
-                {"inputTokens": 0, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
-            )
-            t_bucket["inputTokens"] += inp
-            t_bucket["outputTokens"] += out
-            t_bucket["cacheReadInputTokens"] += cache_read
-
-    return {
-        "todayPrompts": today_prompts,
-        "todaySessions": len(today_sessions),
-        "todayTotalTokens": today_total_tokens,
-        "todayTokensByModel": today_tokens_by_model,
-        "recentDays": [recent[d] for d in recent_dates],
-        "modelUsage": model_usage,
-        "totalPrompts": total_prompts,
-        "totalSessions": len(total_sessions),
-        "activeDays": len(active_days),
-        "activeDates": sorted(active_days),
-    }
+            today_bucket = today_tokens_by_model.setdefault(model, dict(TOKEN_BUCKET))
+            today_bucket["inputTokens"] += values["input"]
+            today_bucket["outputTokens"] += values["output"]
+            today_bucket["cacheReadInputTokens"] += values["cacheRead"]
+            today_bucket["cacheCreationInputTokens"] += values["cacheCreation"]
+    return {"todayPrompts": today_prompts, "todaySessions": len(today_sessions), "todayTotalTokens": today_total_tokens,
+            "todayTokensByModel": today_tokens_by_model, "recentDays": [recent[d] for d in recent_dates],
+            "modelUsage": model_usage, "totalPrompts": total_prompts, "totalSessions": len(total_sessions),
+            "activeDays": len(active_days), "activeDates": sorted(active_days)}
 
 
 def fetch_local_stats(
@@ -495,44 +550,66 @@ def fetch_local_stats(
         except OSError as exc:
             db_errors.append(f"{d.name}: {exc}")
 
-    if db_paths:
-        def iter_rows() -> Iterator[tuple[str, bytes, bytes | None, float | None]]:
-            for db_path in db_paths:
-                # Use full path as session_id so CLI and IDE databases sharing a stem are not merged.
-                session_id = str(db_path)
-                try:
-                    st = db_path.stat()
-                    if st.st_size == 0:
-                        continue
-                    mtime = st.st_mtime
-                except OSError:
-                    mtime = None
-                try:
-                    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro&immutable=1", uri=True, timeout=2)
-                    try:
-                        c = conn.cursor()
-                        # A scalar subquery on steps guarantees exactly 1 row per generation record
-                        # regardless of schema evolution, preventing 1:N join row inflation.
-                        c.execute(
-                            "SELECT g.data, ("
-                            "    SELECT s.metadata FROM steps s "
-                            "    WHERE s.idx = g.idx AND s.metadata IS NOT NULL LIMIT 1"
-                            ") FROM gen_metadata g WHERE g.data IS NOT NULL"
-                        )
-                        for g_data, s_meta in c.fetchall():
-                            if not isinstance(g_data, (bytes, bytearray)):
-                                continue
-                            clean_s_meta = s_meta if isinstance(s_meta, (bytes, bytearray)) else None
-                            yield (session_id, bytes(g_data), bytes(clean_s_meta) if clean_s_meta is not None else None, mtime)
-                    finally:
-                        conn.close()
-                except (sqlite3.Error, OSError) as exc:
-                    db_errors.append(f"{db_path.name}: {exc}")
-                    continue
+    def table_exists(connection: sqlite3.Connection, name: str) -> bool:
+        return connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", (name,)).fetchone() is not None
 
-        stats = stats_from_rows(iter_rows())
-    else:
-        stats = stats_from_rows([])
+    def trajectory_timestamp(connection: sqlite3.Connection) -> int | None:
+        if not table_exists(connection, "trajectory_metadata_blob"):
+            return None
+        row = connection.execute(
+            "SELECT data FROM trajectory_metadata_blob WHERE data IS NOT NULL AND length(data) <= ? LIMIT 1",
+            (MAX_METADATA_BYTES,),
+        ).fetchone()
+        if not row or not isinstance(row[0], (bytes, bytearray)):
+            return None
+        for field, _, value in ProtobufParser(row[0]):
+            if field == 2 and isinstance(value, (bytes, bytearray)):
+                return _timestamp(value)
+        return None
+
+    def iter_events() -> Iterator[dict[str, Any]]:
+        for db_path in db_paths:
+            session_id = str(db_path)
+            try:
+                st = db_path.stat()
+                if st.st_size == 0:
+                    continue
+                mtime = st.st_mtime
+                # mode=ro protects the source while preserving SQLite's live WAL view.
+                conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+            except (OSError, sqlite3.Error) as exc:
+                db_errors.append(f"{db_path.name}: {exc}")
+                continue
+            try:
+                if not table_exists(conn, "gen_metadata"):
+                    db_errors.append(f"{db_path.name}: missing gen_metadata table")
+                    continue
+                fallback_timestamp = trajectory_timestamp(conn)
+                for (blob,) in conn.execute("SELECT data FROM gen_metadata WHERE data IS NOT NULL AND length(data) <= ? ORDER BY idx", (MAX_METADATA_BYTES,)):
+                    if isinstance(blob, (bytes, bytearray)):
+                        for event in _generation_events(blob):
+                            if event["timestamp"] is None:
+                                event["timestamp"] = fallback_timestamp
+                            yield {**event, "session": session_id, "fallback": mtime}
+                oversized = conn.execute("SELECT count(*) FROM gen_metadata WHERE data IS NOT NULL AND length(data) > ?", (MAX_METADATA_BYTES,)).fetchone()[0]
+                if oversized:
+                    db_errors.append(f"{db_path.name}: {oversized} metadata records exceed {MAX_METADATA_BYTES // 1024} KiB")
+                if table_exists(conn, "steps"):
+                    for (blob,) in conn.execute("SELECT metadata FROM steps WHERE metadata IS NOT NULL AND length(metadata) <= ? ORDER BY idx", (MAX_METADATA_BYTES,)):
+                        if isinstance(blob, (bytes, bytearray)):
+                            for event in _step_events(blob):
+                                if event["timestamp"] is None:
+                                    event["timestamp"] = fallback_timestamp
+                                yield {**event, "session": session_id, "fallback": mtime}
+                    oversized_steps = conn.execute("SELECT count(*) FROM steps WHERE metadata IS NOT NULL AND length(metadata) > ?", (MAX_METADATA_BYTES,)).fetchone()[0]
+                    if oversized_steps:
+                        db_errors.append(f"{db_path.name}: {oversized_steps} step records exceed {MAX_METADATA_BYTES // 1024} KiB")
+            except sqlite3.Error as exc:
+                db_errors.append(f"{db_path.name}: {exc}")
+            finally:
+                conn.close()
+
+    stats = stats_from_events(iter_events())
 
     has_local_stats = has_stats(stats)
     record.update(stats)
@@ -601,6 +678,61 @@ def parse_quota_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return limits
 
 
+def run_bounded_command(command: list[str], timeout_seconds: float) -> tuple[int, bytes]:
+    """Run a collector command without buffering more than MAX_RESPONSE_BYTES.
+
+    stderr is intentionally discarded: command output may include credentials or
+    upstream response bodies, neither of which belongs in a collector record.
+    """
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if process.stdout is None:  # pragma: no cover - subprocess guarantees this
+        process.kill()
+        process.wait()
+        raise OSError("agy stdout pipe is unavailable")
+
+    result: dict[str, bytes | BaseException] = {}
+
+    def read_stdout() -> None:
+        try:
+            result["stdout"] = process.stdout.read(MAX_RESPONSE_BYTES + 1)
+        except BaseException as exc:  # pragma: no cover - defensive pipe failure
+            result["error"] = exc
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    started = time.monotonic()
+    reader.start()
+    try:
+        reader.join(timeout_seconds)
+        if reader.is_alive():
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+        if "error" in result:
+            raise OSError("Could not read agy output") from result["error"]
+        stdout = result.get("stdout", b"")
+        if not isinstance(stdout, bytes):  # pragma: no cover - typed guard
+            raise OSError("Could not read agy output")
+        if len(stdout) > MAX_RESPONSE_BYTES:
+            raise ValueError("response payload too large")
+        remaining = max(0.01, timeout_seconds - (time.monotonic() - started))
+        returncode = process.wait(timeout=remaining)
+        return returncode, stdout
+    except subprocess.TimeoutExpired:
+        process.kill()
+        reader.join()
+        process.wait()
+        raise
+    finally:
+        if process.poll() is None:
+            process.kill()
+            reader.join()
+            process.wait()
+        process.stdout.close()
+
+
 def fetch_quota(
     record: dict[str, Any],
     command_override: list[str] | None = None,
@@ -625,38 +757,29 @@ def fetch_quota(
             cmd = [agy_bin, "-p", "/usage", "--output-format", "json"]
 
         try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
+            returncode, stdout = run_bounded_command(cmd, timeout_seconds)
         except subprocess.TimeoutExpired:
             endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text="Usage probe timed out", retry=True)
             return False
-        except OSError as exc:
-            endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text=str(exc))
+        except OSError:
+            endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text="Could not start agy. Check AGY_CLI_PATH or reinstall agy.")
             return False
-
-        if proc.returncode != 0:
-            err = proc.stderr.strip() or f"Command failed with exit code {proc.returncode}"
-            if "not found" in err.lower() or "sign in" in err.lower():
-                auth_missing(record, status="Waiting for agy", help_text=err or AUTH_HELP)
-            else:
-                endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text=err)
-            return False
-
-        stdout = proc.stdout
-        if len(stdout) > MAX_RESPONSE_BYTES:
+        except ValueError:
             endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text="Response payload too large")
+            return False
+
+        if returncode != 0:
+            endpoint_problem(
+                record,
+                status=STATUS_QUOTA_UNAVAILABLE,
+                help_text="The agy usage command failed. Run `agy` to confirm you are signed in.",
+            )
             return False
 
         try:
             payload = json.loads(stdout)
-        except (ValueError, TypeError) as exc:
-            endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text=f"Invalid JSON output: {exc}")
+        except (UnicodeDecodeError, ValueError, TypeError):
+            endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text="agy returned invalid JSON")
             return False
 
         if not isinstance(payload, dict):
@@ -664,11 +787,11 @@ def fetch_quota(
             return False
 
         if payload.get("status") != "SUCCESS":
-            resp = str(payload.get("response") or "Usage query failed")
-            if "not found" in resp.lower() or "sign in" in resp.lower():
-                auth_missing(record, status="Waiting for agy", help_text=resp)
-            else:
-                endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text=resp)
+            endpoint_problem(
+                record,
+                status=STATUS_QUOTA_UNAVAILABLE,
+                help_text="agy could not retrieve usage. Run `agy` to confirm you are signed in.",
+            )
             return False
 
         command = payload.get("command")

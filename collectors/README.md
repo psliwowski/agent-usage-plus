@@ -220,7 +220,8 @@ but is not a public API contract, so an unfamiliar response produces a visible
 The collector reads local stats from Google Antigravity conversation
 SQLite databases under `~/.gemini/antigravity/conversations/*.db`,
 `~/.gemini/antigravity-cli/conversations/*.db`, and
-`~/.gemini/antigravity-ide/conversations/*.db` in SQLite read-only mode (`immutable=1`).
+`~/.gemini/antigravity-ide/conversations/*.db` in SQLite read-only mode, so
+active WAL-backed conversations remain visible without modifying their files.
 The query extracts token metrics and model names from the protobuf-encoded
 `gen_metadata` table without loading message bodies or transcripts into the
 collector. Override locations with `AGY_CONVERSATIONS_DIR` or `AGY_HOME` if databases

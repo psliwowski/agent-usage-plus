@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
+import sys
 from importlib.machinery import SourceFileLoader
 import tempfile
 import types
@@ -841,6 +841,37 @@ class AgyCollectorTests(unittest.TestCase):
         out_of_range_low = b"\n\x02\x08\x00"  # ts = 0
         self.assertIsNone(agy.parse_step_timestamp(out_of_range_low))
 
+    def test_usage_cache_creation_and_viewable_step_timestamp(self) -> None:
+        usage = b"\x10d\x182 \x1e(\x14"  # input=100, output=50, cache write=30, cache read=20
+        generation = b"\x9a\x01\x10gemini-3.8-flash" + b'"' + bytes([len(usage)]) + usage
+        blob = b"\n" + bytes([len(generation)]) + generation
+        stats = agy.stats_from_rows([("session", blob, None, None)], now=datetime.fromtimestamp(1757088000))
+        self.assertEqual(stats["todayTotalTokens"], 200)
+        self.assertEqual(stats["modelUsage"]["gemini-3.8-flash"]["cacheCreationInputTokens"], 30)
+
+        # Some step records only expose their usable timestamp in field 8.
+        viewable_at = b"B\x06\x08\x80\x92\xec\xc5\x06"
+        self.assertEqual(agy.parse_step_timestamp(viewable_at), 1757088000)
+
+    def test_generation_retries_and_continuations_keep_usage_and_model(self) -> None:
+        primary = b"\x10\x05\x18\x03"
+        retry_usage = b"\x10\x07\x18\x02"
+        retry = b"\x12" + bytes([len(retry_usage)]) + retry_usage
+        generation = (
+            b"\x9a\x01\x10gemini-3.8-flash"
+            + b'"' + bytes([len(primary)]) + primary
+            + b"\x8a\x01" + bytes([len(retry)]) + retry
+        )
+        retries_blob = b"\n" + bytes([len(generation)]) + generation
+        continuation_blob = b"\n\x06\"\x04\x10\x0b\x18\x0d"
+        stats = agy.stats_from_rows(
+            [("session", retries_blob, None, None), ("session", continuation_blob, None, None)],
+            now=datetime.fromtimestamp(1757088000),
+        )
+        self.assertEqual(stats["totalPrompts"], 3)
+        self.assertEqual(stats["modelUsage"]["gemini-3.8-flash"]["inputTokens"], 23)
+        self.assertNotIn("gemini", stats["modelUsage"])
+
     def test_real_world_full_protobuf_fixture_end_to_end(self) -> None:
         model, inp, out, cache, resp_id = agy.parse_gen_metadata(self.REAL_WORLD_GEN_METADATA_FIXTURE)
         self.assertEqual(model, "gemini-3.8-flash")
@@ -966,32 +997,30 @@ class AgyCollectorTests(unittest.TestCase):
                 self.assertFalse(r["ready"])
 
             # Non-zero exit code
-            mock_err = subprocess.CompletedProcess(args=["agy"], returncode=1, stdout="", stderr="failed to run")
-            with patch("subprocess.run", return_value=mock_err):
+            with patch.object(agy, "run_bounded_command", return_value=(1, b"secret stderr is never captured")):
                 r = rec()
                 ok = agy.fetch_quota(r, command_override=["agy"])
                 self.assertFalse(ok)
                 self.assertEqual(r["usageStatusText"], agy.STATUS_QUOTA_UNAVAILABLE)
-                self.assertEqual(r["authHelpText"], "failed to run")
+                self.assertNotIn("secret", r["authHelpText"])
                 self.assertFalse(r["ready"])
 
             # OSError when executing binary
-            with patch("subprocess.run", side_effect=OSError("permission denied")):
+            with patch.object(agy, "run_bounded_command", side_effect=OSError("permission denied")):
                 r = rec()
                 ok = agy.fetch_quota(r, command_override=["agy"])
                 self.assertFalse(ok)
                 self.assertEqual(r["limits"], [])
                 self.assertEqual(r["usageStatusText"], agy.STATUS_QUOTA_UNAVAILABLE)
-                self.assertIn("permission denied", r["authHelpText"])
+                self.assertNotIn("permission denied", r["authHelpText"])
                 self.assertFalse(r["ready"])
 
             # Invalid JSON output
-            mock_bad = subprocess.CompletedProcess(args=["agy"], returncode=0, stdout="not-json", stderr="")
-            with patch("subprocess.run", return_value=mock_bad):
+            with patch.object(agy, "run_bounded_command", return_value=(0, b"not-json")):
                 r = rec()
                 ok = agy.fetch_quota(r, command_override=["agy"])
                 self.assertFalse(ok)
-                self.assertIn("Invalid JSON", r["authHelpText"])
+                self.assertEqual(r["authHelpText"], "agy returned invalid JSON")
                 self.assertFalse(r["ready"])
 
             # Null or non-dict command/data payloads
@@ -1002,8 +1031,7 @@ class AgyCollectorTests(unittest.TestCase):
                 ('{"status": "SUCCESS", "command": {"data": "not-a-dict"}}', "Unexpected data payload"),
                 ('{"status": "SUCCESS", "command": {"data": {"groups": null}}}', "No quota groups returned"),
             ]:
-                mock_payload = subprocess.CompletedProcess(args=["agy"], returncode=0, stdout=bad_payload, stderr="")
-                with patch("subprocess.run", return_value=mock_payload):
+                with patch.object(agy, "run_bounded_command", return_value=(0, bad_payload.encode())):
                     r = rec()
                     ok = agy.fetch_quota(r, command_override=["agy"])
                     self.assertFalse(ok)
@@ -1013,17 +1041,23 @@ class AgyCollectorTests(unittest.TestCase):
                     self.assertFalse(r["ready"])
 
             # Successful quota probe
-            mock_ok = subprocess.CompletedProcess(
-                args=["agy"],
-                returncode=0,
-                stdout='{"status": "SUCCESS", "command": {"data": {"groups": []}}}',
-                stderr="",
-            )
-            with patch("subprocess.run", return_value=mock_ok):
+            with patch.object(agy, "run_bounded_command", return_value=(0, b'{"status": "SUCCESS", "command": {"data": {"groups": []}}}')):
                 r = rec()
                 ok = agy.fetch_quota(r, command_override=["agy"])
                 self.assertTrue(ok)
                 self.assertEqual(r["limits"], [])
+
+            with patch.object(agy, "run_bounded_command", return_value=(0, b'{"status": "FAILED", "response": "token=do-not-expose"}')):
+                r = rec()
+                self.assertFalse(agy.fetch_quota(r, command_override=["agy"]))
+                self.assertNotIn("do-not-expose", r["authHelpText"])
+
+    def test_run_bounded_command_rejects_large_output(self) -> None:
+        with self.assertRaises(ValueError):
+            agy.run_bounded_command(
+                [sys.executable, "-c", f"import sys; sys.stdout.buffer.write(b'x' * {MAX_RESPONSE_BYTES + 1})"],
+                timeout_seconds=5,
+            )
 
     def test_default_conversations_dirs(self) -> None:
         with patch.dict("os.environ", {}, clear=True), patch("pathlib.Path.home", return_value=Path("/fake/home")):
@@ -1085,6 +1119,21 @@ class AgyCollectorTests(unittest.TestCase):
             self.assertFalse(rec3["hasPromptStats"])
             self.assertNotIn("usageStatusText", rec3)
 
+    def test_fetch_local_stats_reads_active_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "active.db"
+            writer = sqlite3.connect(db_path)
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)")
+            writer.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?)", (self.SAMPLE_GEN_METADATA_BLOB,))
+            writer.commit()
+            try:
+                rec = agy.base_record("agy", "Antigravity", "Antigravity")
+                self.assertTrue(agy.fetch_local_stats(rec, conversations_dirs=[Path(tmpdir)]))
+                self.assertEqual(rec["totalPrompts"], 1)
+            finally:
+                writer.close()
+
     def test_fetch_local_stats_exposes_database_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             # 1. Schema error: valid SQLite DB missing the gen_metadata table
@@ -1097,7 +1146,7 @@ class AgyCollectorTests(unittest.TestCase):
             ok = agy.fetch_local_stats(rec, conversations_dirs=[Path(tmpdir)])
             self.assertFalse(ok)
             self.assertEqual(rec["usageStatusText"], agy.STATUS_DATABASE_ERROR)
-            self.assertIn("no such table", rec["authHelpText"])
+            self.assertIn("missing gen_metadata table", rec["authHelpText"])
             self.assertFalse(rec["hasLocalStats"])
             self.assertFalse(rec["hasPromptStats"])
 
@@ -1127,16 +1176,10 @@ class AgyCollectorTests(unittest.TestCase):
                 self.assertFalse(record["ready"])
 
             # 4. collect() exposes DB error even if quota probe succeeds, but sets ready=True
-            mock_proc = subprocess.CompletedProcess(
-                args=["agy"],
-                returncode=0,
-                stdout='{"status": "SUCCESS", "command": {"data": {"groups": []}}}',
-                stderr="",
-            )
             with (
                 patch.object(agy, "default_conversations_dirs", return_value=[Path(tmpdir)]),
                 patch("shutil.which", return_value="/fake/agy"),
-                patch("subprocess.run", return_value=mock_proc),
+                patch.object(agy, "run_bounded_command", return_value=(0, b'{"status": "SUCCESS", "command": {"data": {"groups": []}}}')),
             ):
                 record = agy.collect()
                 self.assertEqual(record["usageStatusText"], agy.STATUS_DATABASE_ERROR)
