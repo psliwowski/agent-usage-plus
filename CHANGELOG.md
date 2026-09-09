@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Google Antigravity (`agy`) collector and provider mark: reads local CLI and IDE
+  SQLite databases for token and session history, plus quota allowances from
+  `agy -p /usage --output-format json`.
+
 ### Fixed
 
 - Right-clicking a provider mark in the bar no longer launches the wrong
