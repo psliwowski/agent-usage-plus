@@ -34,7 +34,16 @@ AUTH_HELP = "Run `agy` to sign in. Local stats are still shown."
 STATUS_QUOTA_UNAVAILABLE = f"{AGENT_NAME} quota unavailable"
 STATUS_DATABASE_ERROR = f"{AGENT_NAME} database error"
 STATUS_DB_ERROR = STATUS_DATABASE_ERROR
-MAX_METADATA_BYTES = 64 * 1024
+# Antigravity embeds an entire tool payload or the full chat context in some
+# gen_metadata/steps rows (observed up to ~920 KiB); this bounds how much of a
+# row we will ever read, without excluding the small usage fields that live
+# alongside that bulk data.
+MAX_METADATA_BYTES = 2 * 1024 * 1024
+# A single embedded field this large is bulk context/tool-payload data we
+# never read, not a token/timestamp/model field. ProtobufParser skips past
+# oversized fields instead of aborting the whole message, so the small fields
+# that matter still get parsed regardless of where they sit in the message.
+MAX_FIELD_BYTES = 64 * 1024
 TOKEN_BUCKET = {
     "inputTokens": 0,
     "outputTokens": 0,
@@ -50,7 +59,10 @@ TOKEN_BUCKET = {
 # collector dependency-free Python (3.10+) as described in collectors/README.md
 # (avoiding third-party dependencies such as google.protobuf), this module
 # implements a hand-written, stream-based Tag-Length-Value (TLV) wire format
-# parser.
+# parser. Some rows embed a large, unrelated field (full chat context, tool
+# payloads) alongside the small usage/timestamp fields we actually want; the
+# parser skips oversized fields rather than aborting the whole message, so
+# those small fields are still found regardless of field order.
 # ---------------------------------------------------------------------------
 
 class ProtobufParser:
@@ -61,9 +73,8 @@ class ProtobufParser:
     """
 
     def __init__(self, source: bytes | bytearray) -> None:
-        MAX_PAYLOAD_BYTES = 64 * 1024
         self._data: bytes | bytearray = source
-        self._valid: bool = bool(source and len(source) <= MAX_PAYLOAD_BYTES)
+        self._valid: bool = bool(source and len(source) <= MAX_METADATA_BYTES)
 
     @staticmethod
     def read_varint(stream: io.BytesIO) -> int | None:
@@ -118,8 +129,6 @@ class ProtobufParser:
         MIN_PROTO_FIELD_NUMBER = 1
         MAX_PROTO_FIELD_NUMBER = (1 << 29) - 1
 
-        MAX_PAYLOAD_BYTES = 64 * 1024
-
         stream = io.BytesIO(self._data)
         while True:
             key = self.read_varint(stream)
@@ -139,8 +148,14 @@ class ProtobufParser:
                 yield field_num, wire_type, val
             elif wire_type == WIRE_LENGTH_DELIMITED:
                 length = self.read_varint(stream)
-                if length is None or length < 0 or length > MAX_PAYLOAD_BYTES:
+                if length is None or length < 0:
                     break
+                if length > MAX_FIELD_BYTES:
+                    # Bulk data we never read (chat context, tool payloads):
+                    # skip past it without materializing it, and keep parsing
+                    # so later, smaller fields (tokens, timestamps) aren't lost.
+                    stream.seek(length, io.SEEK_CUR)
+                    continue
                 payload = stream.read(length)
                 if len(payload) < length:
                     break
@@ -678,17 +693,20 @@ def parse_quota_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return limits
 
 
-def run_bounded_command(command: list[str], timeout_seconds: float) -> tuple[int, bytes]:
+def run_bounded_command(command: list[str], timeout_seconds: float, *, merge_stderr: bool = False) -> tuple[int, bytes]:
     """Run a collector command without buffering more than MAX_RESPONSE_BYTES.
 
-    stderr is intentionally discarded: command output may include credentials or
+    stderr is discarded by default: command output may include credentials or
     upstream response bodies, neither of which belongs in a collector record.
+    Pass merge_stderr=True only for a fixed, low-risk status probe (never the
+    quota command itself) whose stderr is a short built-in message the caller
+    classifies and discards, never stores or surfaces verbatim.
     """
     process = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
     )
     if process.stdout is None:  # pragma: no cover - subprocess guarantees this
         process.kill()
@@ -733,6 +751,44 @@ def run_bounded_command(command: list[str], timeout_seconds: float) -> tuple[int
         process.stdout.close()
 
 
+AGY_AUTH_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+AGY_AUTH_STATE_SIGNED_IN = "signed_in"
+AGY_AUTH_STATE_SIGNED_OUT = "signed_out"
+AGY_AUTH_STATE_UNKNOWN = "unknown"
+
+
+def _agy_auth_state(agy_bin: str, timeout_seconds: float) -> str:
+    """Cheap, non-interactive check for whether agy is signed in.
+
+    `agy -p ...` runs a real agent turn: when signed out, it prints an OAuth
+    URL, opens the user's browser, and blocks for up to a minute waiting for
+    the callback. Calling it on every unattended refresh while signed out
+    means a fresh browser tab grabbing focus on every cycle. `agy models`
+    fails fast (no browser, no prompt) when signed out, so it gates every
+    quota probe instead of ever letting a signed-out state reach `-p`.
+
+    Returns AGY_AUTH_STATE_SIGNED_IN, AGY_AUTH_STATE_SIGNED_OUT (the probe
+    itself reported the sign-in message), or AGY_AUTH_STATE_UNKNOWN — a probe
+    failure unrelated to auth (timeout, launch failure, an unrecognized
+    non-zero exit) — which the caller must treat as a transport problem, not
+    silently as "not signed in". agy prints its sign-in message to stderr, so
+    this merges stderr into the captured output (unlike the quota command,
+    whose stderr is always discarded); the merged text is only classified
+    here, never placed in the record.
+    """
+    try:
+        returncode, output = run_bounded_command([agy_bin, "models"], timeout_seconds, merge_stderr=True)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return AGY_AUTH_STATE_UNKNOWN
+    if returncode == 0:
+        return AGY_AUTH_STATE_SIGNED_IN
+    if b"sign in" in output.lower():
+        return AGY_AUTH_STATE_SIGNED_OUT
+    return AGY_AUTH_STATE_UNKNOWN
+
+
 def fetch_quota(
     record: dict[str, Any],
     command_override: list[str] | None = None,
@@ -753,6 +809,13 @@ def fetch_quota(
             agy_bin = os.environ.get("AGY_CLI_PATH") or shutil.which("agy")
             if not agy_bin:
                 auth_missing(record, status="Waiting for agy", help_text="agy not found in PATH")
+                return False
+            auth_state = _agy_auth_state(agy_bin, min(timeout_seconds, AGY_AUTH_PROBE_TIMEOUT_SECONDS))
+            if auth_state == AGY_AUTH_STATE_SIGNED_OUT:
+                auth_missing(record, status="Waiting for agy", help_text=AUTH_HELP)
+                return False
+            if auth_state == AGY_AUTH_STATE_UNKNOWN:
+                endpoint_problem(record, status=STATUS_QUOTA_UNAVAILABLE, help_text="Could not confirm agy sign-in state", retry=True)
                 return False
             cmd = [agy_bin, "-p", "/usage", "--output-format", "json"]
 

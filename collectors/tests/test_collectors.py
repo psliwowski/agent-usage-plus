@@ -820,7 +820,7 @@ class AgyCollectorTests(unittest.TestCase):
         self.assertEqual(agy.parse_gen_metadata(b"\x08\x01"), ("", 0, 0, 0, ""))
 
         # Payloads exceeding maximum metadata size limit are rejected
-        oversized = b"\x00" * (64 * 1024 + 1)
+        oversized = b"\x00" * (agy.MAX_METADATA_BYTES + 1)
         self.assertEqual(agy.parse_gen_metadata(oversized), ("", 0, 0, 0, ""))
 
         # Valid step timestamp parsing
@@ -913,6 +913,35 @@ class AgyCollectorTests(unittest.TestCase):
             self.assertEqual(bucket["outputTokens"], 151)
             self.assertEqual(bucket["cacheReadInputTokens"], 8135)
 
+    def test_row_with_bulky_embedded_context_field_still_yields_tokens(self) -> None:
+        # Antigravity's final gen_metadata row of a session embeds the full chat
+        # context alongside the small usage fields, pushing some rows past the old
+        # 64 KiB cap (observed up to ~920 KiB) — that cap used to drop the whole row,
+        # tokens included. Field 2 here (tag 0x12) stands in for that bulk context.
+        bulky_context_field = b"\x12" + _encode_varint(100_000) + b"\x00" * 100_000
+        blob = self.SAMPLE_GEN_METADATA_BLOB + bulky_context_field
+        self.assertGreater(len(blob), 64 * 1024)
+        self.assertLess(len(blob), agy.MAX_METADATA_BYTES)
+
+        model, inp, out, cache, _ = agy.parse_gen_metadata(blob)
+        self.assertEqual(model, "gemini-3.8-flash")
+        self.assertEqual((inp, out, cache), (100, 50, 20))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "bulky_session.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)")
+            conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (0, ?)", (blob,))
+            conn.commit()
+            conn.close()
+
+            rec = agy.base_record("agy", "Antigravity", "Antigravity")
+            ok = agy.fetch_local_stats(rec, conversations_dirs=[Path(tmpdir)])
+            self.assertTrue(ok)
+            self.assertEqual(rec["totalPrompts"], 1)
+            self.assertEqual(rec["modelUsage"]["gemini-3.8-flash"]["inputTokens"], 100)
+            self.assertNotIn("usageStatusText", rec)
+
     def test_protobuf_parser_iterable_and_guardrails(self) -> None:
         # ProtobufParser can be instantiated with bytes and iterated directly
         parser = agy.ProtobufParser(b"\x08\x01")
@@ -931,10 +960,18 @@ class AgyCollectorTests(unittest.TestCase):
         excessive_key = b"\x80\x80\x80\x80\x10"
         self.assertEqual(list(agy.ProtobufParser(excessive_key)), [])
 
-        # Length-delimited fields declaring payload lengths exceeding max size are rejected
+        # A length-delimited field declaring a payload larger than MAX_FIELD_BYTES is
+        # skipped (not materialized), not aborted — parsing continues afterwards.
         # Tag 0x0A (field 1, wire type 2), length varint = 131072 (exceeds 64 KiB)
         oversized_len_field = b"\n\x80\x80\x08"
         self.assertEqual(list(agy.ProtobufParser(oversized_len_field)), [])
+
+        # A small field following an oversized one (e.g. a huge embedded chat-context
+        # or tool-payload blob) is still yielded: the oversized field is skipped over,
+        # it does not abort parsing of the rest of the message.
+        padding_len = agy.MAX_FIELD_BYTES + 1  # 65537
+        oversized_then_small = b"\n" + _encode_varint(padding_len) + b"\x00" * padding_len + b"\x08\x01"
+        self.assertEqual(list(agy.ProtobufParser(oversized_then_small)), [(1, 0, 1)])
 
     def test_stats_from_rows(self) -> None:
         fixed_now = datetime.fromtimestamp(1757088000)
@@ -979,6 +1016,58 @@ class AgyCollectorTests(unittest.TestCase):
         self.assertEqual(empty["todayPrompts"], 0)
         self.assertEqual(empty["todayTotalTokens"], 0)
         self.assertEqual(empty["totalPrompts"], 0)
+
+    def test_fetch_quota_never_runs_print_mode_while_signed_out(self) -> None:
+        rec = lambda: agy.base_record("agy", "Antigravity", "Antigravity")
+        with (
+            tempfile.TemporaryDirectory() as empty_state_dir,
+            patch("agent_usage_collectors.common.usage_dir", return_value=Path(empty_state_dir)),
+            patch.object(shutil, "which", return_value="/usr/bin/agy"),
+        ):
+            # `agy models` fails fast (no browser, no prompt) when signed out. That must
+            # be enough to report auth-missing without ever running `agy -p /usage`,
+            # which opens a browser and blocks waiting for OAuth when signed out.
+            with patch.object(agy, "run_bounded_command", return_value=(1, b"Please sign in")) as mock_run:
+                r = rec()
+                ok = agy.fetch_quota(r)
+                self.assertFalse(ok)
+                self.assertEqual(r["usageStatusText"], "Waiting for agy")
+                self.assertEqual(r["authHelpText"], agy.AUTH_HELP)
+                self.assertFalse(r["ready"])
+                mock_run.assert_called_once_with(
+                    ["/usr/bin/agy", "models"], agy.AGY_AUTH_PROBE_TIMEOUT_SECONDS, merge_stderr=True
+                )
+
+            # A timeout, launch failure, or unrecognized non-zero exit on the probe
+            # itself is a transport problem, not a confirmed sign-out — it must never
+            # be reported as "sign in" (which would be misleading), and it must still
+            # never let a `-p /usage` attempt through while auth state is unknown.
+            with patch.object(agy, "run_bounded_command", side_effect=agy.subprocess.TimeoutExpired(["agy", "models"], 5)) as mock_run:
+                r = rec()
+                self.assertFalse(agy.fetch_quota(r))
+                self.assertEqual(r["usageStatusText"], agy.STATUS_QUOTA_UNAVAILABLE)
+                self.assertNotEqual(r["usageStatusText"], "Waiting for agy")
+                mock_run.assert_called_once()
+
+            with patch.object(agy, "run_bounded_command", return_value=(127, b"command not found")) as mock_run:
+                r = rec()
+                self.assertFalse(agy.fetch_quota(r))
+                self.assertEqual(r["usageStatusText"], agy.STATUS_QUOTA_UNAVAILABLE)
+                mock_run.assert_called_once()
+
+            # Signed in: the probe succeeds, so the real usage probe still runs.
+            with patch.object(
+                agy,
+                "run_bounded_command",
+                side_effect=[(0, b""), (0, b'{"status": "SUCCESS", "command": {"data": {"groups": []}}}')],
+            ) as mock_run:
+                r = rec()
+                ok = agy.fetch_quota(r)
+                self.assertTrue(ok)
+                self.assertEqual(r["limits"], [])
+                self.assertEqual(mock_run.call_count, 2)
+                self.assertEqual(mock_run.call_args_list[0].args[0], ["/usr/bin/agy", "models"])
+                self.assertEqual(mock_run.call_args_list[1].args[0], ["/usr/bin/agy", "-p", "/usage", "--output-format", "json"])
 
     def test_fetch_quota_handles_cli_failures(self) -> None:
         rec = lambda: agy.base_record("agy", "Antigravity", "Antigravity")
@@ -1298,6 +1387,18 @@ class AgyCollectorTests(unittest.TestCase):
             record = agy.collect()
             self.assertFalse(record["ready"])
             self.assertEqual(record["usageStatusText"], "Waiting for agy")
+
+
+def _encode_varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
 
 
 def _utc_midnight_ms(days_ago: int) -> float:
