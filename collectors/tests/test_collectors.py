@@ -5,9 +5,11 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
 import tempfile
+import textwrap
 import types
 import unittest
 from pathlib import Path
@@ -742,6 +744,8 @@ class AgyCollectorTests(unittest.TestCase):
                     {"window": "weekly", "remaining_fraction": 0.88, "reset_time": "2026-09-12T03:32:00Z"},
                     {"window": "5h", "remaining_fraction": 0.45, "reset_time": "2026-09-05T22:51:00Z"},
                     {"window": "5h", "remaining_fraction": "invalid"},
+                    {"window": "5h", "remaining_fraction": "NaN"},
+                    {"window": "5h", "remaining_fraction": "Infinity"},
                 ],
             },
             {
@@ -1399,6 +1403,86 @@ def _encode_varint(value: int) -> bytes:
         else:
             out.append(byte)
             return bytes(out)
+class CodexCompatTests(unittest.TestCase):
+    # The reader Omarchy's packaged collector ships, verbatim, so the compat
+    # patch has to match it exactly.
+    PACKAGED_RPC_REQUEST = textwrap.dedent(
+        """\
+        def rpc_request(proc, request_id, method, params=None, timeout=8):
+          payload = {"id": request_id, "method": method, "params": params or {}}
+          proc.stdin.write(json.dumps(payload) + "\\n")
+          proc.stdin.flush()
+          deadline = time.time() + timeout
+          while time.time() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+            if not ready:
+              continue
+            line = proc.stdout.readline()
+            if not line:
+              break
+            try:
+              message = json.loads(line)
+            except Exception:
+              continue
+            if message.get("id") == request_id:
+              return message
+          raise TimeoutError(method)
+        """
+    )
+
+    # Codex 0.156 writes notifications and the reply in a single chunk.
+    FAKE_CODEX = textwrap.dedent(
+        """\
+        import json, os, sys
+        for line in sys.stdin:
+          request = json.loads(line)
+          messages = [
+            {"method": "remoteControl/status/changed", "params": {}},
+            {"id": request["id"], "result": {"account": {"planType": "pro"}}},
+          ]
+          os.write(1, ("\\n".join(json.dumps(m) for m in messages) + "\\n").encode())
+        """
+    )
+
+    def base_collector(self, directory: Path) -> Path:
+        path = directory / "omarchy-agent-usage-codex"
+        path.write_text(
+            "import json, os, select, subprocess, sys, time\n\n"
+            + self.PACKAGED_RPC_REQUEST
+            + textwrap.dedent(
+                f"""
+                proc = subprocess.Popen([sys.executable, "-c", {self.FAKE_CODEX!r}],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                try:
+                  print(json.dumps(rpc_request(proc, 2, "account/read", timeout=1)))
+                except TimeoutError as exc:
+                  print(json.dumps({{"timeout": str(exc)}}))
+                finally:
+                  proc.kill()
+                """
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def run_collector(self, *command: str, base: Path) -> dict:
+        env = dict(os.environ, AGENT_USAGE_PLUS_CODEX_BASE_COLLECTOR=str(base))
+        output = subprocess.run(
+            [sys.executable, *command], env=env, capture_output=True, text=True, check=True, timeout=10
+        ).stdout
+        return json.loads(output)
+
+    def test_packaged_reader_misses_a_reply_batched_with_a_notification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self.base_collector(Path(tmp))
+            self.assertEqual(self.run_collector(str(base), base=base), {"timeout": "account/read"})
+
+    def test_compat_reads_a_reply_batched_with_a_notification(self) -> None:
+        compat = Path(__file__).parents[1] / "bin" / "omarchy-agent-usage-codex-compat"
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self.base_collector(Path(tmp))
+            message = self.run_collector(str(compat), base=base)
+        self.assertEqual(message, {"id": 2, "result": {"account": {"planType": "pro"}}})
 
 
 def _utc_midnight_ms(days_ago: int) -> float:

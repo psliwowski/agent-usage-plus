@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -666,6 +667,8 @@ def parse_quota_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             try:
                 remaining = float(bucket.get("remaining_fraction"))
             except (ValueError, TypeError):
+                continue
+            if not math.isfinite(remaining):
                 continue
 
             window = bucket.get("window")
